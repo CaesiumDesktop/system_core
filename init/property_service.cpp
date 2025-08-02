@@ -76,6 +76,8 @@
 #include "util.h"
 #include "vendor_init.h"
 
+static constexpr char kOverrideProp[] = "/system/etc/override.prop";
+
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_FOLDERNAME[] =
         "/dev/__properties__/appcompat_override";
 [[maybe_unused]] static constexpr char APPCOMPAT_OVERRIDE_PROP_TREE_FILE[] =
@@ -1232,6 +1234,15 @@ void PropertyLoadBootDefaults() {
     }
 
     initialize_microdroid_properties(&properties);
+
+    if (access(kOverrideProp, R_OK) == 0) {
+        LOG(INFO) << "Loading " << kOverrideProp;
+        if (auto res = load_properties_from_file(kOverrideProp, nullptr, &properties);
+            !res.ok()) {
+            LOG(WARNING) << res.error();
+        }
+    }
+
     for (const auto& [name, value] : properties) {
         std::string error;
         if (PropertySetNoSocket(name, value, &error) != PROP_SUCCESS) {

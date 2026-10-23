@@ -187,6 +187,7 @@ libinit_cc_defaults {
         "libbootloader_message",
         "liblmkd_utils",
         "liblz4",
+        "liblzma",
         "libzstd",
         "libmodprobe",
         "libprocinfo",

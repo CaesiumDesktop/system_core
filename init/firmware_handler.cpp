@@ -28,6 +28,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <memory>
+#include <mutex>
 #include <thread>
 
 #include <android-base/file.h>
@@ -36,6 +38,11 @@
 #include <android-base/scopeguard.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
+
+#include <7zCrc.h>
+#include <Xz.h>
+#include <XzCrc64.h>
+#include <zstd.h>
 
 #include "exthandler/exthandler.h"
 
@@ -66,19 +73,130 @@ bool EqualMatch(const std::string& pattern, const std::string& path) {
 }
 }  // namespace
 
+enum class FirmwareCompression { kNone, kZstd, kXz };
+
+// Suffixes the kernel's firmware loader (CONFIG_FW_LOADER_COMPRESS) also falls back to, in the
+// same order: the raw file is tried first.
+static const struct {
+    const char* suffix;
+    FirmwareCompression compression;
+} kFirmwareSuffixes[] = {
+        {"", FirmwareCompression::kNone},
+        {".zst", FirmwareCompression::kZstd},
+        {".xz", FirmwareCompression::kXz},
+};
+
+static constexpr size_t kDecompressChunkSize = 64 * 1024;
+
+// The kernel does not decompress firmware that is delivered through the sysfs fallback, so do it
+// here and stream the result into the firmware data node.
+static bool DecompressZstd(const std::string& in, int data_fd) {
+    std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> ctx(ZSTD_createDCtx(), ZSTD_freeDCtx);
+    if (!ctx) return false;
+
+    std::vector<char> out(kDecompressChunkSize);
+    ZSTD_inBuffer in_buf = {in.data(), in.size(), 0};
+    size_t ret;
+    do {
+        ZSTD_outBuffer out_buf = {out.data(), out.size(), 0};
+        ret = ZSTD_decompressStream(ctx.get(), &out_buf, &in_buf);
+        if (ZSTD_isError(ret)) {
+            LOG(ERROR) << "firmware: zstd decompression failed: " << ZSTD_getErrorName(ret);
+            return false;
+        }
+        if (!WriteFully(data_fd, out.data(), out_buf.pos)) {
+            PLOG(ERROR) << "firmware: write failed";
+            return false;
+        }
+        // Keep going while the input is not consumed or the output buffer was filled, as more
+        // data may be pending in the decoder.
+        if (ret != 0 && in_buf.pos == in_buf.size && out_buf.pos < out.size()) {
+            LOG(ERROR) << "firmware: truncated zstd data";
+            return false;
+        }
+    } while (ret != 0);
+    return true;
+}
+
+static bool DecompressXz(const std::string& in, int data_fd) {
+    static std::once_flag crc_initialized;
+    std::call_once(crc_initialized, []() {
+        CrcGenerateTable();
+        Crc64GenerateTable();
+    });
+
+    ISzAlloc alloc;
+    alloc.Alloc = [](ISzAllocPtr, size_t size) { return malloc(size); };
+    alloc.Free = [](ISzAllocPtr, void* ptr) { free(ptr); };
+
+    CXzUnpacker state{};
+    XzUnpacker_Construct(&state, &alloc);
+    auto free_state = android::base::make_scope_guard([&state]() { XzUnpacker_Free(&state); });
+
+    std::vector<Byte> out(kDecompressChunkSize);
+    const Byte* src = reinterpret_cast<const Byte*>(in.data());
+    size_t src_remaining = in.size();
+    while (true) {
+        SizeT dest_len = out.size();
+        SizeT src_len = src_remaining;
+        ECoderStatus status;
+        SRes res = XzUnpacker_Code(&state, out.data(), &dest_len, src, &src_len,
+                                   /*srcFinished=*/true, CODER_FINISH_ANY, &status);
+        if (res != SZ_OK) {
+            LOG(ERROR) << "firmware: xz decompression failed: " << res;
+            return false;
+        }
+        src += src_len;
+        src_remaining -= src_len;
+        if (!WriteFully(data_fd, out.data(), dest_len)) {
+            PLOG(ERROR) << "firmware: write failed";
+            return false;
+        }
+        // All input consumed and the output buffer not filled: nothing is pending anymore.
+        if (src_remaining == 0 && dest_len < out.size()) {
+            if (!XzUnpacker_IsStreamWasFinished(&state)) {
+                LOG(ERROR) << "firmware: truncated xz data";
+                return false;
+            }
+            return true;
+        }
+        if (src_len == 0 && dest_len == 0) {
+            LOG(ERROR) << "firmware: xz decompression made no progress";
+            return false;
+        }
+    }
+}
+
 static void LoadFirmware(const std::string& firmware, const std::string& root, int fw_fd,
-                         size_t fw_size, int loading_fd, int data_fd) {
+                         size_t fw_size, FirmwareCompression compression, int loading_fd,
+                         int data_fd) {
     // Start transfer.
     WriteFully(loading_fd, "1", 1);
 
     // Copy the firmware.
-    int rc = sendfile(data_fd, fw_fd, nullptr, fw_size);
-    if (rc == -1) {
-        PLOG(ERROR) << "firmware: sendfile failed { '" << root << "', '" << firmware << "' }";
+    bool ok;
+    if (compression == FirmwareCompression::kNone) {
+        ok = sendfile(data_fd, fw_fd, nullptr, fw_size) != -1;
+        if (!ok) {
+            PLOG(ERROR) << "firmware: sendfile failed { '" << root << "', '" << firmware << "' }";
+        }
+    } else {
+        std::string compressed;
+        ok = ReadFdToString(fw_fd, &compressed);
+        if (!ok) {
+            PLOG(ERROR) << "firmware: read failed { '" << root << "', '" << firmware << "' }";
+        } else {
+            ok = compression == FirmwareCompression::kZstd ? DecompressZstd(compressed, data_fd)
+                                                           : DecompressXz(compressed, data_fd);
+            if (!ok) {
+                LOG(ERROR) << "firmware: decompression failed { '" << root << "', '" << firmware
+                           << "' }";
+            }
+        }
     }
 
     // Tell the firmware whether to abort or commit.
-    const char* response = (rc != -1) ? "0" : "-1";
+    const char* response = ok ? "0" : "-1";
     WriteFully(loading_fd, response, strlen(response));
 }
 
@@ -204,22 +322,26 @@ void FirmwareHandler::ProcessFirmwareEvent(const std::string& path, const std::s
 
     std::vector<std::string> attempted_paths_and_errors;
     auto TryLoadFirmware = [&](const std::string& firmware_directory) {
-        std::string file = firmware_directory + firmware;
-        unique_fd fw_fd(open(file.c_str(), O_RDONLY | O_CLOEXEC));
-        if (fw_fd == -1) {
-            attempted_paths_and_errors.emplace_back("firmware: attempted " + file +
-                                                    ", open failed: " + strerror(errno));
-            return false;
+        for (const auto& [suffix, compression] : kFirmwareSuffixes) {
+            std::string file = firmware_directory + firmware + suffix;
+            unique_fd fw_fd(open(file.c_str(), O_RDONLY | O_CLOEXEC));
+            if (fw_fd == -1) {
+                attempted_paths_and_errors.emplace_back("firmware: attempted " + file +
+                                                        ", open failed: " + strerror(errno));
+                continue;
+            }
+            struct stat sb;
+            if (fstat(fw_fd.get(), &sb) == -1) {
+                attempted_paths_and_errors.emplace_back("firmware: attempted " + file +
+                                                        ", fstat failed: " + strerror(errno));
+                continue;
+            }
+            LOG(INFO) << "found " << file << " for " << path;
+            LoadFirmware(firmware, root, fw_fd.get(), sb.st_size, compression, loading_fd.get(),
+                         data_fd.get());
+            return true;
         }
-        struct stat sb;
-        if (fstat(fw_fd.get(), &sb) == -1) {
-            attempted_paths_and_errors.emplace_back("firmware: attempted " + file +
-                                                    ", fstat failed: " + strerror(errno));
-            return false;
-        }
-        LOG(INFO) << "found " << file << " for " << path;
-        LoadFirmware(firmware, root, fw_fd.get(), sb.st_size, loading_fd.get(), data_fd.get());
-        return true;
+        return false;
     };
 
     while (true) {

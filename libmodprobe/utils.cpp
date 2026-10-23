@@ -16,14 +16,29 @@
 
 #include <modprobe/utils.h>
 
+#include <string.h>
 #include <sys/syscall.h>
 
 #include <android-base/logging.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 
+#ifndef MODULE_INIT_COMPRESSED_FILE
+#define MODULE_INIT_COMPRESSED_FILE 4
+#endif
+
 namespace android {
 namespace modprobe {
+
+// Compression suffixes the kernel can decompress itself (CONFIG_MODULE_DECOMPRESS).
+static const char* const kCompressedSuffixes[] = {".gz", ".xz", ".zst"};
+
+static bool IsCompressedModule(const std::string& module_path) {
+    for (const char* suffix : kCompressedSuffixes) {
+        if (android::base::EndsWith(module_path, suffix)) return true;
+    }
+    return false;
+}
 
 std::string CanonicalizeModulePath(const std::string& module_path) {
     auto start = module_path.find_last_of('/');
@@ -33,7 +48,13 @@ std::string CanonicalizeModulePath(const std::string& module_path) {
         start += 1;
     }
     auto end = module_path.size();
-    if (android::base::EndsWith(module_path, ".ko")) {
+    for (const char* suffix : kCompressedSuffixes) {
+        if (android::base::EndsWith(module_path, std::string(".ko") + suffix)) {
+            end -= 3 + strlen(suffix);
+            break;
+        }
+    }
+    if (end == module_path.size() && android::base::EndsWith(module_path, ".ko")) {
         end -= 3;
     }
     if ((end - start) <= 1) {
@@ -65,7 +86,8 @@ base::Result<void> InitModule(const std::string& path_name,
         PLOG(ERROR) << "Could not open module '" << path_name << "'";
         return android::base::ErrnoError();
     }
-    int ret = syscall(__NR_finit_module, fd.get(), options.c_str(), 0);
+    int flags = IsCompressedModule(path_name) ? MODULE_INIT_COMPRESSED_FILE : 0;
+    int ret = syscall(__NR_finit_module, fd.get(), options.c_str(), flags);
     if (ret != 0) {
         if (errno != EEXIST) {
             PLOG(ERROR) << "Failed to insmod '" << path_name << "' with args '" << options << "'";

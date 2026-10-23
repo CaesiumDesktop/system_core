@@ -24,7 +24,15 @@
 namespace android {
 namespace modprobe {
 
+#ifndef MODULE_INIT_COMPRESSED_FILE
+#define MODULE_INIT_COMPRESSED_FILE 4
+#endif
+
 std::string CanonicalizeModulePath(const std::string& module_path);
+
+// Whether the module file is compressed (by suffix) and must be loaded with
+// MODULE_INIT_COMPRESSED_FILE so the kernel decompresses it.
+bool IsCompressedModule(const std::string& module_path);
 
 base::Result<void> InitModule(const std::string& path_name,
                               const std::unordered_map<std::string, std::string>& module_options,

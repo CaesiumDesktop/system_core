@@ -23,17 +23,13 @@
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 
-#ifndef MODULE_INIT_COMPRESSED_FILE
-#define MODULE_INIT_COMPRESSED_FILE 4
-#endif
-
 namespace android {
 namespace modprobe {
 
 // Compression suffixes the kernel can decompress itself (CONFIG_MODULE_DECOMPRESS).
 static const char* const kCompressedSuffixes[] = {".gz", ".xz", ".zst"};
 
-static bool IsCompressedModule(const std::string& module_path) {
+bool IsCompressedModule(const std::string& module_path) {
     for (const char* suffix : kCompressedSuffixes) {
         if (android::base::EndsWith(module_path, suffix)) return true;
     }

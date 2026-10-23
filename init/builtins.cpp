@@ -65,6 +65,7 @@
 #include <libgsi/libgsi.h>
 #include <logwrap/logwrap.h>
 #include <private/android_filesystem_config.h>
+#include <modprobe/utils.h>
 #include <selinux/android.h>
 #include <selinux/label.h>
 #include <selinux/selinux.h>
@@ -361,6 +362,8 @@ static Result<void> do_insmod(const BuiltinArguments& args) {
 
     unique_fd fd(TEMP_FAILURE_RETRY(open(filename.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC)));
     if (fd == -1) return ErrnoError() << "open(\"" << filename << "\") failed";
+
+    if (modprobe::IsCompressedModule(filename)) flags |= MODULE_INIT_COMPRESSED_FILE;
 
     int rc = syscall(__NR_finit_module, fd.get(), options.c_str(), flags);
     if (rc == -1) return ErrnoError() << "finit_module for \"" << filename << "\" failed";
